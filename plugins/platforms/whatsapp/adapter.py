@@ -19,8 +19,12 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import signal
 import subprocess
+import time
+import uuid
+from dataclasses import dataclass, replace
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -210,6 +214,25 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+@dataclass
+class _WhatsAppSession:
+    session_id: str
+    chat_key: str
+    created_at: float
+    last_activity_at: float
+    title: str = ""
+    root_message_id: Optional[str] = None
+    status: str = "idle"
+
+
+@dataclass
+class _WhatsAppSessionRoute:
+    event: MessageEvent
+    session_id: Optional[str] = None
+    created_new: bool = False
+    had_existing_session: bool = False
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -281,6 +304,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
+        self._sessions_enabled = self._truthy_config(
+            "enable_sessions", env_name="WHATSAPP_ENABLE_SESSIONS", default=True
+        )
+        session_idle_minutes = config.extra.get(
+            "session_idle_minutes", os.getenv("WHATSAPP_SESSION_IDLE_MINUTES", "60")
+        )
+        self._session_idle_seconds = max(1, int(float(session_idle_minutes) * 60))
+        self._session_max_live_per_chat = max(
+            1,
+            int(
+                config.extra.get(
+                    "session_max_live_per_chat",
+                    os.getenv("WHATSAPP_SESSION_MAX_LIVE_PER_CHAT", "5"),
+                )
+            ),
+        )
+        self._whatsapp_sessions: Dict[str, _WhatsAppSession] = {}
+        self._whatsapp_message_sessions: Dict[str, str] = {}
+        self._whatsapp_chat_focus: Dict[str, str] = {}
         self._dm_policy = str(config.extra.get("dm_policy") or os.getenv("WHATSAPP_DM_POLICY", "open")).strip().lower()
         self._allow_from = self._coerce_allow_list(config.extra.get("allow_from") or config.extra.get("allowFrom"))
         self._group_policy = str(config.extra.get("group_policy") or os.getenv("WHATSAPP_GROUP_POLICY", "open")).strip().lower()
@@ -336,6 +378,485 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return float(default)
         return parsed
 
+    def _effective_reply_prefix(self) -> str:
+        """Return the prefix the Node bridge will add in self-chat mode."""
+        whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
+        if whatsapp_mode != "self-chat":
+            return ""
+        if self._reply_prefix is not None:
+            return self._reply_prefix.replace("\\n", "\n")
+        env_prefix = os.getenv("WHATSAPP_REPLY_PREFIX")
+        if env_prefix is not None:
+            return env_prefix.replace("\\n", "\n")
+        return self.DEFAULT_REPLY_PREFIX
+
+    def _outgoing_chunk_limit(self) -> int:
+        """Reserve room for the bridge-side prefix so final WhatsApp text fits."""
+        prefix_len = len(self._effective_reply_prefix())
+        # Keep enough space for truncate_message's pagination indicator and
+        # code-fence repair even if a user configures a very long prefix.
+        return max(1024, self.MAX_MESSAGE_LENGTH - prefix_len)
+
+    def _truthy_config(self, key: str, *, env_name: str, default: bool = False) -> bool:
+        raw = self.config.extra.get(key)
+        if raw is None:
+            raw = os.getenv(env_name)
+        if raw is None:
+            return default
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _session_chat_key(source) -> str:
+        return f"{source.chat_type}:{source.chat_id}" if source else "unknown"
+
+    def _whatsapp_session_is_live(self, session_id: Optional[str], *, now: Optional[float] = None) -> bool:
+        if not session_id:
+            return False
+        session = self._whatsapp_sessions.get(session_id)
+        if session is None or session.status == "expired":
+            return False
+        if now is None:
+            now = time.time()
+        if (now - session.last_activity_at) > self._session_idle_seconds:
+            session.status = "expired"
+            return False
+        return True
+
+    def _create_whatsapp_session(
+        self,
+        chat_key: str,
+        *,
+        root_message_id: Optional[str] = None,
+        title: str = "",
+        now: Optional[float] = None,
+    ) -> str:
+        now = now if now is not None else time.time()
+        session_id = f"wa-session-{uuid.uuid4().hex[:10]}"
+        self._whatsapp_sessions[session_id] = _WhatsAppSession(
+            session_id=session_id,
+            chat_key=chat_key,
+            created_at=now,
+            last_activity_at=now,
+            root_message_id=root_message_id,
+            title=(title or "")[:80],
+        )
+        self._whatsapp_chat_focus[chat_key] = session_id
+        self._prune_whatsapp_sessions(chat_key, now=now)
+        return session_id
+
+    def _touch_whatsapp_session(self, session_id: str, *, now: Optional[float] = None) -> None:
+        session = self._whatsapp_sessions.get(session_id)
+        if session is None:
+            return
+        session.status = "idle"
+        session.last_activity_at = now if now is not None else time.time()
+        self._whatsapp_chat_focus[session.chat_key] = session_id
+
+    def _register_whatsapp_session_message(self, message_id: Optional[str], session_id: Optional[str]) -> None:
+        if message_id and session_id:
+            self._whatsapp_message_sessions[str(message_id)] = session_id
+
+    def _prune_whatsapp_sessions(self, chat_key: str, *, now: Optional[float] = None) -> None:
+        now = now if now is not None else time.time()
+        live_for_chat = [
+            session for session in self._whatsapp_sessions.values()
+            if session.chat_key == chat_key and self._whatsapp_session_is_live(session.session_id, now=now)
+        ]
+        live_for_chat.sort(key=lambda session: session.last_activity_at, reverse=True)
+        for session in live_for_chat[self._session_max_live_per_chat:]:
+            session.status = "expired"
+            for msg_id, mapped_session in list(self._whatsapp_message_sessions.items()):
+                if mapped_session == session.session_id:
+                    self._whatsapp_message_sessions.pop(msg_id, None)
+
+    def _resolve_whatsapp_session(self, event: MessageEvent) -> tuple[str, bool, bool]:
+        """Return ``(session_id, created_new, had_existing_session)`` for an inbound event."""
+        now = time.time()
+        chat_key = self._session_chat_key(event.source)
+        had_existing_session = any(session.chat_key == chat_key for session in self._whatsapp_sessions.values())
+        explicit_session = getattr(event.source, "thread_id", None)
+        if explicit_session and self._whatsapp_session_is_live(explicit_session, now=now):
+            session = self._whatsapp_sessions.get(explicit_session)
+            if session and session.chat_key == chat_key:
+                self._touch_whatsapp_session(explicit_session, now=now)
+                return explicit_session, False, had_existing_session
+        quoted_id = getattr(event, "reply_to_message_id", None)
+        quoted_text = getattr(event, "reply_to_text", None)
+        if quoted_id:
+            known_session = self._whatsapp_message_sessions.get(str(quoted_id))
+            if self._whatsapp_session_is_live(known_session, now=now):
+                session = self._whatsapp_sessions.get(known_session)
+                if session and session.chat_key == chat_key:
+                    self._touch_whatsapp_session(known_session, now=now)
+                    return known_session, False, had_existing_session
+            session_id = self._create_whatsapp_session(
+                chat_key,
+                root_message_id=str(quoted_id),
+                title=str(quoted_text or event.text or "quoted reply"),
+                now=now,
+            )
+            self._register_whatsapp_session_message(str(quoted_id), session_id)
+            return session_id, True, had_existing_session
+
+        focus_session = self._whatsapp_chat_focus.get(chat_key)
+        if self._whatsapp_session_is_live(focus_session, now=now):
+            self._touch_whatsapp_session(focus_session, now=now)
+            return focus_session, False, had_existing_session
+        session_id = self._create_whatsapp_session(chat_key, title=str(event.text or ""), now=now)
+        return session_id, True, had_existing_session
+
+    def _resolve_whatsapp_session_id(self, event: MessageEvent) -> str:
+        session_id, _, _ = self._resolve_whatsapp_session(event)
+        return session_id
+
+    def _live_whatsapp_sessions_for_chat(self, chat_key: str) -> list[_WhatsAppSession]:
+        now = time.time()
+        sessions = [
+            session for session in self._whatsapp_sessions.values()
+            if session.chat_key == chat_key and self._whatsapp_session_is_live(session.session_id, now=now)
+        ]
+        sessions.sort(key=lambda session: session.last_activity_at, reverse=True)
+        return sessions
+
+    def _format_whatsapp_session_list(self, source) -> str:
+        chat_key = self._session_chat_key(source)
+        sessions = self._live_whatsapp_sessions_for_chat(chat_key)
+        if not sessions:
+            return "No active WhatsApp sessions yet. Use /sessions new to start one."
+        focus_session = self._whatsapp_chat_focus.get(chat_key)
+        lines = ["Active WhatsApp sessions:"]
+        for idx, session in enumerate(sessions, start=1):
+            marker = " ← current" if session.session_id == focus_session else ""
+            title = session.title or session.root_message_id or session.session_id
+            lines.append(f"{idx}. {session.session_id} — {title}{marker}")
+        lines.append("Use /sessions new to start a fresh session, or /sessions <number> to switch focus.")
+        return "\n".join(lines)
+
+    async def _handle_whatsapp_session_command(self, event: MessageEvent) -> bool:
+        if not self._sessions_enabled or not event:
+            return False
+        if event.get_command() != "sessions":
+            return False
+        chat_key = self._session_chat_key(event.source)
+        args = event.get_command_args().strip()
+        reply_to = getattr(event, "message_id", None)
+        metadata = {"thread_id": event.source.thread_id} if event.source and event.source.thread_id else None
+
+        if not args:
+            await self.send(
+                event.source.chat_id,
+                self._format_whatsapp_session_list(event.source),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return True
+
+        first, _, rest = args.partition(" ")
+        first_lower = first.lower()
+        if first_lower in {"new", "fresh", "create"}:
+            session_id = self._create_whatsapp_session(
+                chat_key,
+                root_message_id=reply_to,
+                title=(rest or "new session"),
+            )
+            self._register_whatsapp_session_message(reply_to, session_id)
+            if rest.strip():
+                await self._send_whatsapp_session_notice(event, session_id, rest.strip())
+                source = replace(event.source, thread_id=session_id)
+                routed = replace(
+                    event,
+                    text=rest.strip(),
+                    message_type=MessageType.TEXT,
+                    source=source,
+                )
+                await super().handle_message(routed)
+            else:
+                await self.send(
+                    event.source.chat_id,
+                    f"New WhatsApp session created: {session_id}\nYour next unquoted message will use it.",
+                    reply_to=reply_to,
+                    metadata={"thread_id": session_id},
+                )
+            return True
+
+        if first_lower.isdigit():
+            sessions = self._live_whatsapp_sessions_for_chat(chat_key)
+            index = int(first_lower) - 1
+            if 0 <= index < len(sessions):
+                session = sessions[index]
+                self._touch_whatsapp_session(session.session_id)
+                self._register_whatsapp_session_message(reply_to, session.session_id)
+                await self.send(
+                    event.source.chat_id,
+                    f"Switched WhatsApp session to {index + 1}: {session.session_id}\nYour next unquoted message will use it.",
+                    reply_to=reply_to,
+                    metadata={"thread_id": session.session_id},
+                )
+            else:
+                await self.send(
+                    event.source.chat_id,
+                    self._format_whatsapp_session_list(event.source),
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+            return True
+
+        await self.send(
+            event.source.chat_id,
+            "Usage: /sessions, /sessions new, /sessions new <message>, or /sessions <number>",
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        return True
+
+    def _route_event_to_session_info(self, event: MessageEvent) -> _WhatsAppSessionRoute:
+        """Attach WhatsApp soft-thread session metadata and return routing details."""
+        if not self._sessions_enabled or not event or not event.source:
+            return _WhatsAppSessionRoute(event=event)
+        session_id, created_new, had_existing_session = self._resolve_whatsapp_session(event)
+        source = replace(event.source, thread_id=session_id)
+        routed = replace(event, source=source)
+        self._register_whatsapp_session_message(getattr(event, "message_id", None), session_id)
+        return _WhatsAppSessionRoute(
+            event=routed,
+            session_id=session_id,
+            created_new=created_new,
+            had_existing_session=had_existing_session,
+        )
+
+    def _route_event_to_session(self, event: MessageEvent) -> MessageEvent:
+        """Attach WhatsApp soft-thread session metadata before BasePlatformAdapter routing.
+
+        WhatsApp sessions are represented as synthetic ``source.thread_id`` values so
+        the existing session key/session store machinery creates a separate
+        Hermes session for each active WhatsApp session.
+        """
+        return self._route_event_to_session_info(event).event
+
+    def _format_whatsapp_session_notice(self, session_id: str, text: Optional[str]) -> str:
+        preview = (text or "").strip().replace("\n", " ")
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+        if preview:
+            return f"🧵 New WhatsApp session started: {session_id}\nProcessing separately: '{preview}'"
+        return f"🧵 New WhatsApp session started: {session_id}\nProcessing separately."
+
+    async def _send_whatsapp_session_notice(self, event: MessageEvent, session_id: Optional[str], text: Optional[str]) -> None:
+        if not event or not event.source or not session_id:
+            return
+        try:
+            await self.send(
+                event.source.chat_id,
+                self._format_whatsapp_session_notice(session_id, text),
+                reply_to=getattr(event, "message_id", None),
+                metadata={"thread_id": session_id},
+            )
+        except Exception as exc:
+            logger.debug("[%s] WhatsApp session notice send failed: %s", self.name, exc)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        if await self._handle_whatsapp_session_command(event):
+            return
+        session_route = self._route_event_to_session_info(event)
+        if session_route.created_new and session_route.had_existing_session and session_route.event.message_type == MessageType.TEXT:
+            await self._send_whatsapp_session_notice(event, session_route.session_id, event.text)
+        await super().handle_message(session_route.event)
+
+    def _whatsapp_require_mention(self) -> bool:
+        configured = self.config.extra.get("require_mention")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("WHATSAPP_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+
+    def _whatsapp_free_response_chats(self) -> set[str]:
+        raw = self.config.extra.get("free_response_chats")
+        if raw is None:
+            raw = os.getenv("WHATSAPP_FREE_RESPONSE_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    @staticmethod
+    def _coerce_allow_list(raw) -> set[str]:
+        """Parse allow_from / group_allow_from from config or env var."""
+        if raw is None:
+            return set()
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    @staticmethod
+    def _is_broadcast_chat(chat_id: str) -> bool:
+        """True for WhatsApp pseudo-chats that aren't real conversations.
+
+        Covers Status updates (Stories) and Channel/Newsletter broadcasts.
+        These show up as inbound messages on Baileys but the agent should
+        never reply — answering a Story update spams the contact's status
+        feed, and Channel posts aren't addressable in the first place.
+        """
+        if not chat_id:
+            return False
+        cid = chat_id.strip().lower()
+        if cid == "status@broadcast":
+            return True
+        # @broadcast suffix covers status@broadcast plus any future
+        # broadcast-list variants. @newsletter is the Channel JID suffix.
+        if cid.endswith("@broadcast") or cid.endswith("@newsletter"):
+            return True
+        return False
+
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        """WhatsApp gates DM/group access at intake via dm_policy/group_policy."""
+        return True
+
+    def _is_dm_allowed(self, sender_id: str) -> bool:
+        """Check whether a DM from the given sender should be processed."""
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return sender_id in self._allow_from
+        # "open" — all DMs allowed
+        return True
+
+    def _is_group_allowed(self, chat_id: str) -> bool:
+        """Check whether a group chat should be processed."""
+        if self._group_policy == "disabled":
+            return False
+        if self._group_policy == "allowlist":
+            return chat_id in self._group_allow_from
+        # "open" — all groups allowed
+        return True
+
+    def _compile_mention_patterns(self):
+        patterns = self.config.extra.get("mention_patterns")
+        if patterns is None:
+            raw = os.getenv("WHATSAPP_MENTION_PATTERNS", "").strip()
+            if raw:
+                try:
+                    patterns = json.loads(raw)
+                except Exception:
+                    patterns = [part.strip() for part in raw.splitlines() if part.strip()]
+                    if not patterns:
+                        patterns = [part.strip() for part in raw.split(",") if part.strip()]
+        if patterns is None:
+            return []
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        if not isinstance(patterns, list):
+            logger.warning("[%s] whatsapp mention_patterns must be a list or string; got %s", self.name, type(patterns).__name__)
+            return []
+
+        compiled = []
+        for pattern in patterns:
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            try:
+                compiled.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as exc:
+                logger.warning("[%s] Invalid WhatsApp mention pattern %r: %s", self.name, pattern, exc)
+        if compiled:
+            logger.info("[%s] Loaded %d WhatsApp mention pattern(s)", self.name, len(compiled))
+        return compiled
+
+    @staticmethod
+    def _normalize_whatsapp_id(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        normalized = str(value).strip()
+        if ":" in normalized and "@" in normalized:
+            normalized = normalized.replace(":", "@", 1)
+        return normalized
+
+    def _bot_ids_from_message(self, data: Dict[str, Any]) -> set[str]:
+        bot_ids = set()
+        for candidate in data.get("botIds") or []:
+            normalized = self._normalize_whatsapp_id(candidate)
+            if normalized:
+                bot_ids.add(normalized)
+        return bot_ids
+
+    def _message_is_reply_to_bot(self, data: Dict[str, Any]) -> bool:
+        quoted_participant = self._normalize_whatsapp_id(data.get("quotedParticipant"))
+        if not quoted_participant:
+            return False
+        return quoted_participant in self._bot_ids_from_message(data)
+
+    def _message_mentions_bot(self, data: Dict[str, Any]) -> bool:
+        bot_ids = self._bot_ids_from_message(data)
+        if not bot_ids:
+            return False
+        mentioned_ids = {
+            nid
+            for candidate in (data.get("mentionedIds") or [])
+            if (nid := self._normalize_whatsapp_id(candidate))
+        }
+        if mentioned_ids & bot_ids:
+            return True
+
+        body = str(data.get("body") or "")
+        lower_body = body.lower()
+        for bot_id in bot_ids:
+            bare_id = bot_id.split("@", 1)[0].lower()
+            if bare_id and (f"@{bare_id}" in lower_body or bare_id in lower_body):
+                return True
+        return False
+
+    def _message_matches_mention_patterns(self, data: Dict[str, Any]) -> bool:
+        if not self._mention_patterns:
+            return False
+        body = str(data.get("body") or "")
+        return any(pattern.search(body) for pattern in self._mention_patterns)
+
+    def _clean_bot_mention_text(self, text: str, data: Dict[str, Any]) -> str:
+        if not text:
+            return text
+        bot_ids = self._bot_ids_from_message(data)
+        cleaned = text
+        for bot_id in bot_ids:
+            bare_id = bot_id.split("@", 1)[0]
+            if bare_id:
+                cleaned = re.sub(rf"@{re.escape(bare_id)}\b[,:\-]*\s*", "", cleaned)
+        return cleaned.strip() or text
+
+    def _should_process_message(self, data: Dict[str, Any]) -> bool:
+        chat_id_raw = str(data.get("chatId") or "")
+        # WhatsApp uses pseudo-chats for Status updates (Stories) and
+        # Channel/Newsletter broadcasts. These are not real conversations
+        # and the agent should never reply to them — even in self-chat mode
+        # where the bridge may surface them as "fromMe" events.
+        if self._is_broadcast_chat(chat_id_raw):
+            return False
+        is_group = data.get("isGroup", False)
+        if is_group:
+            chat_id = chat_id_raw
+            if not self._is_group_allowed(chat_id):
+                return False
+        else:
+            sender_id = str(data.get("senderId") or data.get("from") or "")
+            if not self._is_dm_allowed(sender_id):
+                return False
+            # DMs that pass the policy gate are always processed
+            return True
+        # Group messages: check mention / free-response settings
+        chat_id = str(data.get("chatId") or "")
+        if chat_id in self._whatsapp_free_response_chats():
+            return True
+        if not self._whatsapp_require_mention():
+            return True
+        body = str(data.get("body") or "").strip()
+        if body.startswith("/"):
+            return True
+        if self._message_is_reply_to_bot(data):
+            return True
+        if self._message_mentions_bot(data):
+            return True
+        return self._message_matches_mention_patterns(data)
+    
     async def connect(self) -> bool:
         """
         Start the WhatsApp bridge.
@@ -751,6 +1272,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if resp.status == 200:
                         data = await resp.json()
                         last_message_id = data.get("messageId")
+                        session_id = (
+                            (metadata or {}).get("thread_id")
+                            if isinstance(metadata, dict)
+                            else None
+                        )
+                        self._register_whatsapp_session_message(last_message_id, session_id)
                     else:
                         error = await resp.text()
                         return SendResult(success=False, error=error)
@@ -1187,6 +1714,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         except Exception as e:
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
+            reply_to_message_id = data.get("quotedMessageId") or None
+            reply_to_text = data.get("quotedText") or None
+            if isinstance(reply_to_message_id, str) and not reply_to_message_id.strip():
+                reply_to_message_id = None
+            if isinstance(reply_to_text, str) and not reply_to_text.strip():
+                reply_to_text = None
+
             return MessageEvent(
                 text=body,
                 message_type=msg_type,
@@ -1195,6 +1729,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 message_id=data.get("messageId"),
                 media_urls=cached_urls,
                 media_types=media_types,
+                reply_to_message_id=reply_to_message_id,
+                reply_to_text=reply_to_text,
             )
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
