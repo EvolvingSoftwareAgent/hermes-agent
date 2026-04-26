@@ -120,6 +120,35 @@ whatsapp:
 - `unauthorized_dm_behavior: pair` is the global default. Unknown DM senders get a pairing code.
 - `whatsapp.unauthorized_dm_behavior: ignore` makes WhatsApp stay silent for unauthorized DMs, which is usually the better choice for a private number.
 
+### Conversation lanes
+
+WhatsApp chats are flat, so Hermes can create lightweight conversation lanes by mapping replies to synthetic thread IDs. This keeps side topics from contaminating the main chat context while reusing Hermes' existing per-thread session storage.
+
+Lane behavior:
+
+- Unquoted messages continue in the current lane.
+- Replying to a known Hermes message routes your reply back to that message's lane.
+- Replying to an unknown older message starts a fresh lane.
+- Internal updates, such as background-process notifications, preserve their originating lane.
+
+Commands:
+
+```text
+/lanes                 # list active lanes
+/lanes new             # make the next unquoted message use a fresh lane
+/lanes new <message>   # create a fresh lane and send <message> there now
+/lanes <number>        # switch the current unquoted-message focus
+```
+
+Optional lane settings:
+
+```yaml
+whatsapp:
+  enable_lanes: true            # default: true
+  lane_idle_minutes: 60         # expire inactive lanes after this many minutes
+  lane_max_live_per_chat: 5     # cap remembered lanes per WhatsApp chat
+```
+
 Then start the gateway:
 
 ```bash

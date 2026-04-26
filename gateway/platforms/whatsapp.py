@@ -22,6 +22,9 @@ import os
 import platform
 import re
 import subprocess
+import time
+import uuid
+from dataclasses import dataclass, replace
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
@@ -66,6 +69,37 @@ def _kill_port_process(port: int) -> None:
     except Exception:
         pass
 
+
+def _terminate_bridge_process(proc, *, force: bool = False) -> None:
+    """Terminate the bridge process using process-tree semantics where possible."""
+    if _IS_WINDOWS:
+        cmd = ["taskkill", "/PID", str(proc.pid), "/T"]
+        if force:
+            cmd.append("/F")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except FileNotFoundError:
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+            return
+
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "").strip()
+            raise OSError(details or f"taskkill failed for PID {proc.pid}")
+        return
+
+    import signal
+
+    sig = signal.SIGTERM if not force else signal.SIGKILL
+    os.killpg(os.getpgid(proc.pid), sig)
+
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -79,6 +113,25 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_url,
 )
+
+
+@dataclass
+class _WhatsAppLane:
+    lane_id: str
+    chat_key: str
+    created_at: float
+    last_activity_at: float
+    title: str = ""
+    root_message_id: Optional[str] = None
+    status: str = "idle"
+
+
+@dataclass
+class _WhatsAppLaneRoute:
+    event: MessageEvent
+    lane_id: Optional[str] = None
+    created_new: bool = False
+    had_existing_lane: bool = False
 
 
 def check_whatsapp_requirements() -> bool:
@@ -118,10 +171,15 @@ class WhatsAppAdapter(BasePlatformAdapter):
     - bridge_script: Path to the Node.js bridge script
     - bridge_port: Port for HTTP communication (default: 3000)
     - session_path: Path to store WhatsApp session data
+    - dm_policy: "open" | "allowlist" | "disabled" — how DMs are handled (default: "open")
+    - allow_from: List of sender IDs allowed in DMs (when dm_policy="allowlist")
+    - group_policy: "open" | "allowlist" | "disabled" — which groups are processed (default: "open")
+    - group_allow_from: List of group JIDs allowed (when group_policy="allowlist")
     """
     
-    # WhatsApp message limits
-    MAX_MESSAGE_LENGTH = 65536  # WhatsApp allows longer messages
+    # WhatsApp message limits — practical UX limit, not protocol max.
+    # WhatsApp allows ~65K but long messages are unreadable on mobile.
+    MAX_MESSAGE_LENGTH = 4096
     
     # Default bridge location relative to the hermes-agent install
     _DEFAULT_BRIDGE_DIR = Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
@@ -139,12 +197,298 @@ class WhatsAppAdapter(BasePlatformAdapter):
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
+        self._lanes_enabled = self._truthy_config(
+            "enable_lanes", env_name="WHATSAPP_ENABLE_LANES", default=True
+        )
+        lane_idle_minutes = config.extra.get(
+            "lane_idle_minutes", os.getenv("WHATSAPP_LANE_IDLE_MINUTES", "60")
+        )
+        self._lane_idle_seconds = max(1, int(float(lane_idle_minutes) * 60))
+        self._lane_max_live_per_chat = max(
+            1,
+            int(
+                config.extra.get(
+                    "lane_max_live_per_chat",
+                    os.getenv("WHATSAPP_LANE_MAX_LIVE_PER_CHAT", "5"),
+                )
+            ),
+        )
+        self._whatsapp_lanes: Dict[str, _WhatsAppLane] = {}
+        self._whatsapp_message_lanes: Dict[str, str] = {}
+        self._whatsapp_chat_focus: Dict[str, str] = {}
+        self._dm_policy = str(config.extra.get("dm_policy") or os.getenv("WHATSAPP_DM_POLICY", "open")).strip().lower()
+        self._allow_from = self._coerce_allow_list(config.extra.get("allow_from") or config.extra.get("allowFrom"))
+        self._group_policy = str(config.extra.get("group_policy") or os.getenv("WHATSAPP_GROUP_POLICY", "open")).strip().lower()
+        self._group_allow_from = self._coerce_allow_list(config.extra.get("group_allow_from") or config.extra.get("groupAllowFrom"))
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = None
         self._bridge_log: Optional[Path] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
+
+    def _truthy_config(self, key: str, *, env_name: str, default: bool = False) -> bool:
+        raw = self.config.extra.get(key)
+        if raw is None:
+            raw = os.getenv(env_name)
+        if raw is None:
+            return default
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _lane_chat_key(source) -> str:
+        return f"{source.chat_type}:{source.chat_id}" if source else "unknown"
+
+    def _whatsapp_lane_is_live(self, lane_id: Optional[str], *, now: Optional[float] = None) -> bool:
+        if not lane_id:
+            return False
+        lane = self._whatsapp_lanes.get(lane_id)
+        if lane is None or lane.status == "expired":
+            return False
+        if now is None:
+            now = time.time()
+        if (now - lane.last_activity_at) > self._lane_idle_seconds:
+            lane.status = "expired"
+            return False
+        return True
+
+    def _create_whatsapp_lane(
+        self,
+        chat_key: str,
+        *,
+        root_message_id: Optional[str] = None,
+        title: str = "",
+        now: Optional[float] = None,
+    ) -> str:
+        now = now if now is not None else time.time()
+        lane_id = f"wa-lane-{uuid.uuid4().hex[:10]}"
+        self._whatsapp_lanes[lane_id] = _WhatsAppLane(
+            lane_id=lane_id,
+            chat_key=chat_key,
+            created_at=now,
+            last_activity_at=now,
+            root_message_id=root_message_id,
+            title=(title or "")[:80],
+        )
+        self._whatsapp_chat_focus[chat_key] = lane_id
+        self._prune_whatsapp_lanes(chat_key, now=now)
+        return lane_id
+
+    def _touch_whatsapp_lane(self, lane_id: str, *, now: Optional[float] = None) -> None:
+        lane = self._whatsapp_lanes.get(lane_id)
+        if lane is None:
+            return
+        lane.status = "idle"
+        lane.last_activity_at = now if now is not None else time.time()
+        self._whatsapp_chat_focus[lane.chat_key] = lane_id
+
+    def _register_whatsapp_lane_message(self, message_id: Optional[str], lane_id: Optional[str]) -> None:
+        if message_id and lane_id:
+            self._whatsapp_message_lanes[str(message_id)] = lane_id
+
+    def _prune_whatsapp_lanes(self, chat_key: str, *, now: Optional[float] = None) -> None:
+        now = now if now is not None else time.time()
+        live_for_chat = [
+            lane for lane in self._whatsapp_lanes.values()
+            if lane.chat_key == chat_key and self._whatsapp_lane_is_live(lane.lane_id, now=now)
+        ]
+        live_for_chat.sort(key=lambda lane: lane.last_activity_at, reverse=True)
+        for lane in live_for_chat[self._lane_max_live_per_chat:]:
+            lane.status = "expired"
+            for msg_id, mapped_lane in list(self._whatsapp_message_lanes.items()):
+                if mapped_lane == lane.lane_id:
+                    self._whatsapp_message_lanes.pop(msg_id, None)
+
+    def _resolve_whatsapp_lane(self, event: MessageEvent) -> tuple[str, bool, bool]:
+        """Return ``(lane_id, created_new, had_existing_lane)`` for an inbound event."""
+        now = time.time()
+        chat_key = self._lane_chat_key(event.source)
+        had_existing_lane = any(lane.chat_key == chat_key for lane in self._whatsapp_lanes.values())
+        explicit_lane = getattr(event.source, "thread_id", None)
+        if explicit_lane and self._whatsapp_lane_is_live(explicit_lane, now=now):
+            lane = self._whatsapp_lanes.get(explicit_lane)
+            if lane and lane.chat_key == chat_key:
+                self._touch_whatsapp_lane(explicit_lane, now=now)
+                return explicit_lane, False, had_existing_lane
+        quoted_id = getattr(event, "reply_to_message_id", None)
+        quoted_text = getattr(event, "reply_to_text", None)
+        if quoted_id:
+            known_lane = self._whatsapp_message_lanes.get(str(quoted_id))
+            if self._whatsapp_lane_is_live(known_lane, now=now):
+                self._touch_whatsapp_lane(known_lane, now=now)
+                return known_lane, False, had_existing_lane
+            lane_id = self._create_whatsapp_lane(
+                chat_key,
+                root_message_id=str(quoted_id),
+                title=str(quoted_text or event.text or "quoted reply"),
+                now=now,
+            )
+            self._register_whatsapp_lane_message(str(quoted_id), lane_id)
+            return lane_id, True, had_existing_lane
+
+        focus_lane = self._whatsapp_chat_focus.get(chat_key)
+        if self._whatsapp_lane_is_live(focus_lane, now=now):
+            self._touch_whatsapp_lane(focus_lane, now=now)
+            return focus_lane, False, had_existing_lane
+        lane_id = self._create_whatsapp_lane(chat_key, title=str(event.text or ""), now=now)
+        return lane_id, True, had_existing_lane
+
+    def _resolve_whatsapp_lane_id(self, event: MessageEvent) -> str:
+        lane_id, _, _ = self._resolve_whatsapp_lane(event)
+        return lane_id
+
+    def _live_whatsapp_lanes_for_chat(self, chat_key: str) -> list[_WhatsAppLane]:
+        now = time.time()
+        lanes = [
+            lane for lane in self._whatsapp_lanes.values()
+            if lane.chat_key == chat_key and self._whatsapp_lane_is_live(lane.lane_id, now=now)
+        ]
+        lanes.sort(key=lambda lane: lane.last_activity_at, reverse=True)
+        return lanes
+
+    def _format_whatsapp_lane_list(self, source) -> str:
+        chat_key = self._lane_chat_key(source)
+        lanes = self._live_whatsapp_lanes_for_chat(chat_key)
+        if not lanes:
+            return "No active WhatsApp lanes yet. Use /lanes new to start one."
+        focus_lane = self._whatsapp_chat_focus.get(chat_key)
+        lines = ["Active WhatsApp lanes:"]
+        for idx, lane in enumerate(lanes, start=1):
+            marker = " ← current" if lane.lane_id == focus_lane else ""
+            title = lane.title or lane.root_message_id or lane.lane_id
+            lines.append(f"{idx}. {lane.lane_id} — {title}{marker}")
+        lines.append("Use /lanes new to force a fresh lane, or /lanes <number> to switch focus.")
+        return "\n".join(lines)
+
+    async def _handle_whatsapp_lane_command(self, event: MessageEvent) -> bool:
+        if not self._lanes_enabled or not event or event.get_command() != "lanes":
+            return False
+        chat_key = self._lane_chat_key(event.source)
+        args = event.get_command_args().strip()
+        reply_to = getattr(event, "message_id", None)
+        metadata = {"thread_id": event.source.thread_id} if event.source and event.source.thread_id else None
+
+        if not args:
+            await self.send(
+                event.source.chat_id,
+                self._format_whatsapp_lane_list(event.source),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return True
+
+        first, _, rest = args.partition(" ")
+        first_lower = first.lower()
+        if first_lower in {"new", "fresh", "create"}:
+            lane_id = self._create_whatsapp_lane(
+                chat_key,
+                root_message_id=reply_to,
+                title=(rest or "new lane"),
+            )
+            self._register_whatsapp_lane_message(reply_to, lane_id)
+            if rest.strip():
+                await self._send_whatsapp_lane_notice(event, lane_id, rest.strip())
+                source = replace(event.source, thread_id=lane_id)
+                routed = replace(
+                    event,
+                    text=rest.strip(),
+                    message_type=MessageType.TEXT,
+                    source=source,
+                )
+                await super().handle_message(routed)
+            else:
+                await self.send(
+                    event.source.chat_id,
+                    f"New WhatsApp lane created: {lane_id}\nYour next unquoted message will use it.",
+                    reply_to=reply_to,
+                    metadata={"thread_id": lane_id},
+                )
+            return True
+
+        if first_lower.isdigit():
+            lanes = self._live_whatsapp_lanes_for_chat(chat_key)
+            index = int(first_lower) - 1
+            if 0 <= index < len(lanes):
+                lane = lanes[index]
+                self._touch_whatsapp_lane(lane.lane_id)
+                self._register_whatsapp_lane_message(reply_to, lane.lane_id)
+                await self.send(
+                    event.source.chat_id,
+                    f"Switched WhatsApp lane to {index + 1}: {lane.lane_id}\nYour next unquoted message will use it.",
+                    reply_to=reply_to,
+                    metadata={"thread_id": lane.lane_id},
+                )
+            else:
+                await self.send(
+                event.source.chat_id,
+                self._format_whatsapp_lane_list(event.source),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return True
+
+        await self.send(
+            event.source.chat_id,
+            "Usage: /lanes, /lanes new, /lanes new <message>, or /lanes <number>",
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+        return True
+
+    def _route_event_to_lane_info(self, event: MessageEvent) -> _WhatsAppLaneRoute:
+        """Attach WhatsApp soft-thread lane metadata and return routing details."""
+        if not self._lanes_enabled or not event or not event.source:
+            return _WhatsAppLaneRoute(event=event)
+        lane_id, created_new, had_existing_lane = self._resolve_whatsapp_lane(event)
+        source = replace(event.source, thread_id=lane_id)
+        routed = replace(event, source=source)
+        self._register_whatsapp_lane_message(getattr(event, "message_id", None), lane_id)
+        return _WhatsAppLaneRoute(
+            event=routed,
+            lane_id=lane_id,
+            created_new=created_new,
+            had_existing_lane=had_existing_lane,
+        )
+
+    def _route_event_to_lane(self, event: MessageEvent) -> MessageEvent:
+        """Attach WhatsApp soft-thread lane metadata before BasePlatformAdapter routing.
+
+        Lanes are represented as synthetic ``source.thread_id`` values so the
+        existing session key/session store machinery creates a separate Hermes
+        session per lane without needing a parallel session subsystem.
+        """
+        return self._route_event_to_lane_info(event).event
+
+    def _format_whatsapp_lane_notice(self, lane_id: str, text: Optional[str]) -> str:
+        preview = (text or "").strip().replace("\n", " ")
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+        if preview:
+            return f"🧵 New WhatsApp lane started: {lane_id}\nProcessing separately: '{preview}'"
+        return f"🧵 New WhatsApp lane started: {lane_id}\nProcessing separately."
+
+    async def _send_whatsapp_lane_notice(self, event: MessageEvent, lane_id: Optional[str], text: Optional[str]) -> None:
+        if not event or not event.source or not lane_id:
+            return
+        try:
+            await self.send(
+                event.source.chat_id,
+                self._format_whatsapp_lane_notice(lane_id, text),
+                reply_to=getattr(event, "message_id", None),
+                metadata={"thread_id": lane_id},
+            )
+        except Exception as exc:
+            logger.debug("[%s] WhatsApp lane notice send failed: %s", self.name, exc)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        if await self._handle_whatsapp_lane_command(event):
+            return
+        lane_route = self._route_event_to_lane_info(event)
+        if lane_route.created_new and lane_route.had_existing_lane and lane_route.event.message_type == MessageType.TEXT:
+            await self._send_whatsapp_lane_notice(event, lane_route.lane_id, event.text)
+        await super().handle_message(lane_route.event)
 
     def _whatsapp_require_mention(self) -> bool:
         configured = self.config.extra.get("require_mention")
@@ -161,6 +505,33 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    @staticmethod
+    def _coerce_allow_list(raw) -> set[str]:
+        """Parse allow_from / group_allow_from from config or env var."""
+        if raw is None:
+            return set()
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _is_dm_allowed(self, sender_id: str) -> bool:
+        """Check whether a DM from the given sender should be processed."""
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "allowlist":
+            return sender_id in self._allow_from
+        # "open" — all DMs allowed
+        return True
+
+    def _is_group_allowed(self, chat_id: str) -> bool:
+        """Check whether a group chat should be processed."""
+        if self._group_policy == "disabled":
+            return False
+        if self._group_policy == "allowlist":
+            return chat_id in self._group_allow_from
+        # "open" — all groups allowed
+        return True
 
     def _compile_mention_patterns(self):
         patterns = self.config.extra.get("mention_patterns")
@@ -254,8 +625,18 @@ class WhatsAppAdapter(BasePlatformAdapter):
         return cleaned.strip() or text
 
     def _should_process_message(self, data: Dict[str, Any]) -> bool:
-        if not data.get("isGroup"):
+        is_group = data.get("isGroup", False)
+        if is_group:
+            chat_id = str(data.get("chatId") or "")
+            if not self._is_group_allowed(chat_id):
+                return False
+        else:
+            sender_id = str(data.get("senderId") or data.get("from") or "")
+            if not self._is_dm_allowed(sender_id):
+                return False
+            # DMs that pass the policy gate are always processed
             return True
+        # Group messages: check mention / free-response settings
         chat_id = str(data.get("chatId") or "")
         if chat_id in self._whatsapp_free_response_chats():
             return True
@@ -288,39 +669,40 @@ class WhatsAppAdapter(BasePlatformAdapter):
         logger.info("[%s] Bridge found at %s", self.name, bridge_path)
         
         # Acquire scoped lock to prevent duplicate sessions
+        lock_acquired = False
         try:
             if not self._acquire_platform_lock('whatsapp-session', str(self._session_path), 'WhatsApp session'):
                 return False
+            lock_acquired = True
         except Exception as e:
             logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
 
-        # Auto-install npm dependencies if node_modules doesn't exist
-        bridge_dir = bridge_path.parent
-        if not (bridge_dir / "node_modules").exists():
-            print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
-            try:
-                install_result = subprocess.run(
-                    ["npm", "install", "--silent"],
-                    cwd=str(bridge_dir),
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-                if install_result.returncode != 0:
-                    print(f"[{self.name}] npm install failed: {install_result.stderr}")
-                    return False
-                print(f"[{self.name}] Dependencies installed")
-            except Exception as e:
-                print(f"[{self.name}] Failed to install dependencies: {e}")
-                return False
-        
         try:
+            # Auto-install npm dependencies if node_modules doesn't exist
+            bridge_dir = bridge_path.parent
+            if not (bridge_dir / "node_modules").exists():
+                print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
+                try:
+                    install_result = subprocess.run(
+                        ["npm", "install", "--silent"],
+                        cwd=str(bridge_dir),
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    if install_result.returncode != 0:
+                        print(f"[{self.name}] npm install failed: {install_result.stderr}")
+                        return False
+                    print(f"[{self.name}] Dependencies installed")
+                except Exception as e:
+                    print(f"[{self.name}] Failed to install dependencies: {e}")
+                    return False
+
             # Ensure session directory exists
             self._session_path.mkdir(parents=True, exist_ok=True)
             
             # Check if bridge is already running and connected
             import aiohttp
-            import asyncio
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
@@ -451,10 +833,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return True
             
         except Exception as e:
-            self._release_platform_lock()
             logger.error("[%s] Failed to start bridge: %s", self.name, e, exc_info=True)
-            self._close_bridge_log()
             return False
+        finally:
+            if not self._running:
+                if lock_acquired:
+                    self._release_platform_lock()
+                self._close_bridge_log()
     
     def _close_bridge_log(self) -> None:
         """Close the bridge log file handle if open."""
@@ -486,22 +871,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
         """Stop the WhatsApp bridge and clean up any orphaned processes."""
         if self._bridge_process:
             try:
-                # Kill the entire process group so child node processes die too
-                import signal
                 try:
-                    if _IS_WINDOWS:
-                        self._bridge_process.terminate()
-                    else:
-                        os.killpg(os.getpgid(self._bridge_process.pid), signal.SIGTERM)
+                    _terminate_bridge_process(self._bridge_process, force=False)
                 except (ProcessLookupError, PermissionError):
                     self._bridge_process.terminate()
                 await asyncio.sleep(1)
                 if self._bridge_process.poll() is None:
                     try:
-                        if _IS_WINDOWS:
-                            self._bridge_process.kill()
-                        else:
-                            os.killpg(os.getpgid(self._bridge_process.pid), signal.SIGKILL)
+                        _terminate_bridge_process(self._bridge_process, force=True)
                     except (ProcessLookupError, PermissionError):
                         self._bridge_process.kill()
             except Exception as e:
@@ -531,6 +908,63 @@ class WhatsAppAdapter(BasePlatformAdapter):
         self._close_bridge_log()
         print(f"[{self.name}] Disconnected")
     
+    def format_message(self, content: str) -> str:
+        """Convert standard markdown to WhatsApp-compatible formatting.
+
+        WhatsApp supports: *bold*, _italic_, ~strikethrough~, ```code```,
+        and monospaced `inline`. Standard markdown uses different syntax
+        for bold/italic/strikethrough, so we convert here.
+
+        Code blocks (``` fenced) and inline code (`) are protected from
+        conversion via placeholder substitution.
+        """
+        if not content:
+            return content
+
+        # --- 1. Protect fenced code blocks from formatting changes ---
+        _FENCE_PH = "\x00FENCE"
+        fences: list[str] = []
+
+        def _save_fence(m: re.Match) -> str:
+            fences.append(m.group(0))
+            return f"{_FENCE_PH}{len(fences) - 1}\x00"
+
+        result = re.sub(r"```[\s\S]*?```", _save_fence, content)
+
+        # --- 2. Protect inline code ---
+        _CODE_PH = "\x00CODE"
+        codes: list[str] = []
+
+        def _save_code(m: re.Match) -> str:
+            codes.append(m.group(0))
+            return f"{_CODE_PH}{len(codes) - 1}\x00"
+
+        result = re.sub(r"`[^`\n]+`", _save_code, result)
+
+        # --- 3. Convert markdown formatting to WhatsApp syntax ---
+        # Bold: **text** or __text__ → *text*
+        result = re.sub(r"\*\*(.+?)\*\*", r"*\1*", result)
+        result = re.sub(r"__(.+?)__", r"*\1*", result)
+        # Strikethrough: ~~text~~ → ~text~
+        result = re.sub(r"~~(.+?)~~", r"~\1~", result)
+        # Italic: *text* is already WhatsApp italic — leave as-is
+        # _text_ is already WhatsApp italic — leave as-is
+
+        # --- 4. Convert markdown headers to bold text ---
+        # # Header → *Header*
+        result = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", result, flags=re.MULTILINE)
+
+        # --- 5. Convert markdown links: [text](url) → text (url) ---
+        result = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", result)
+
+        # --- 6. Restore protected sections ---
+        for i, fence in enumerate(fences):
+            result = result.replace(f"{_FENCE_PH}{i}\x00", fence)
+        for i, code in enumerate(codes):
+            result = result.replace(f"{_CODE_PH}{i}\x00", code)
+
+        return result
+
     async def send(
         self,
         chat_id: str,
@@ -538,38 +972,63 @@ class WhatsAppAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
-        """Send a message via the WhatsApp bridge."""
+        """Send a message via the WhatsApp bridge.
+
+        Formats markdown for WhatsApp, splits long messages into chunks
+        that preserve code block boundaries, and sends each chunk sequentially.
+        """
         if not self._running or not self._http_session:
             return SendResult(success=False, error="Not connected")
         bridge_exit = await self._check_managed_bridge_exit()
         if bridge_exit:
             return SendResult(success=False, error=bridge_exit)
-        
+
+        if not content or not content.strip():
+            return SendResult(success=True, message_id=None)
+
         try:
             import aiohttp
 
-            payload = {
-                "chatId": chat_id,
-                "message": content,
-            }
-            if reply_to:
-                payload["replyTo"] = reply_to
-            
-            async with self._http_session.post(
-                f"http://127.0.0.1:{self._bridge_port}/send",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=30)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return SendResult(
-                        success=True,
-                        message_id=data.get("messageId"),
-                        raw_response=data
-                    )
-                else:
-                    error = await resp.text()
-                    return SendResult(success=False, error=error)
+            # Format and chunk the message
+            formatted = self.format_message(content)
+            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+
+            last_message_id = None
+            for chunk in chunks:
+                payload: Dict[str, Any] = {
+                    "chatId": chat_id,
+                    "message": chunk,
+                }
+                if reply_to and last_message_id is None:
+                    # Only reply-to on the first chunk
+                    payload["replyTo"] = reply_to
+
+                async with self._http_session.post(
+                    f"http://127.0.0.1:{self._bridge_port}/send",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        last_message_id = data.get("messageId")
+                        lane_id = (
+                            (metadata or {}).get("thread_id")
+                            if isinstance(metadata, dict)
+                            else None
+                        )
+                        self._register_whatsapp_lane_message(last_message_id, lane_id)
+                    else:
+                        error = await resp.text()
+                        return SendResult(success=False, error=error)
+
+                # Small delay between chunks to avoid rate limiting
+                if len(chunks) > 1:
+                    await asyncio.sleep(0.3)
+
+            return SendResult(
+                success=True,
+                message_id=last_message_id,
+            )
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
@@ -578,6 +1037,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         chat_id: str,
         message_id: str,
         content: str,
+        *,
+        finalize: bool = False,
     ) -> SendResult:
         """Edit a previously sent message via the WhatsApp bridge."""
         if not self._running or not self._http_session:
@@ -688,6 +1149,17 @@ class WhatsAppAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a video natively via bridge — plays inline in WhatsApp."""
         return await self._send_media_to_bridge(chat_id, video_path, "video", caption)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send an audio file as a WhatsApp voice message via bridge."""
+        return await self._send_media_to_bridge(chat_id, audio_path, "audio", caption)
 
     async def send_document(
         self,
@@ -898,6 +1370,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         except Exception as e:
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
+            reply_to_message_id = data.get("quotedMessageId") or None
+            reply_to_text = data.get("quotedText") or None
+            if isinstance(reply_to_message_id, str) and not reply_to_message_id.strip():
+                reply_to_message_id = None
+            if isinstance(reply_to_text, str) and not reply_to_text.strip():
+                reply_to_text = None
+
             return MessageEvent(
                 text=body,
                 message_type=msg_type,
@@ -906,6 +1385,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 message_id=data.get("messageId"),
                 media_urls=cached_urls,
                 media_types=media_types,
+                reply_to_message_id=reply_to_message_id,
+                reply_to_text=reply_to_text,
             )
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")
