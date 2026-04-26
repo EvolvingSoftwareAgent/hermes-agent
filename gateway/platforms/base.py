@@ -3025,6 +3025,7 @@ class BasePlatformAdapter(ABC):
             if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
                 path = path[1:-1].strip()
             path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
+            path = re.sub(r"(?:\\[nrt]|[\\`\"',.;:)}\]]|[\r\n\t])+$", "", path).strip()
             if path:
                 try:
                     media.append((os.path.expanduser(path), has_voice_tag))
@@ -4429,6 +4430,12 @@ class BasePlatformAdapter(ABC):
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
                                 metadata=_final_thread_metadata,
+                            )
+                        elif ext in _AUDIO_EXTS:
+                            media_result = await self.send_document(
+                                chat_id=event.source.chat_id,
+                                file_path=media_path,
+                                metadata=_thread_metadata,
                             )
                         elif ext in _VIDEO_EXTS:
                             media_result = await self.send_video(

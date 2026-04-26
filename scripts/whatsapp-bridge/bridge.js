@@ -357,7 +357,6 @@ async function startSocket() {
       const messageContent = getMessageContent(msg);
       const contextInfo = getContextInfo(messageContent);
       const mentionedIds = Array.from(new Set((contextInfo?.mentionedJid || []).map(normalizeWhatsAppId).filter(Boolean)));
-      const mentionedIds = Array.from(new Set((contextInfo?.mentionedJid || []).map(normalizeWhatsAppId).filter(Boolean)));
       const quotedMessageId = contextInfo?.stanzaId || null;
       const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '' ) || null;
       const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '' ) || null;
@@ -476,12 +475,9 @@ async function startSocket() {
         mentionedIds,
         quotedMessageId,
         quotedParticipant,
-      const mentionedIds = Array.from(new Set((contextInfo?.mentionedJid || []).map(normalizeWhatsAppId).filter(Boolean)));
-      const quotedMessageId = contextInfo?.stanzaId || null;
-      const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '' ) || null;
-      const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '' ) || null;
-      const hasQuotedMessage = !!contextInfo?.quotedMessage;
-      const quotedText = extractQuotedText(contextInfo?.quotedMessage);
+        quotedRemoteJid,
+        hasQuotedMessage,
+        quotedText,
         botIds,
         timestamp: msg.messageTimestamp,
       };
@@ -609,6 +605,7 @@ const MIME_MAP = {
   mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo',
   mkv: 'video/x-matroska', '3gp': 'video/3gpp',
   pdf: 'application/pdf',
+  wav: 'audio/wav', mp3: 'audio/mpeg', m4a: 'audio/mp4', ogg: 'audio/ogg', opus: 'audio/ogg',
   doc: 'application/msword',
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',

@@ -1111,6 +1111,18 @@ class TestShouldSendMediaAsAudio:
         assert should_send_media_as_audio(Platform.TELEGRAM, ".flac") is False
         assert should_send_media_as_audio(Platform.DISCORD, ".flac") is True
 
+    def test_media_tag_ignores_regex_or_prose_after_media_colon(self):
+        content = r"Example parser: MEDIA:\s*(?P<path>`[^`\n]+`|\S+) should not send files."
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == []
+        assert cleaned == content
+
+    def test_media_tag_strips_escaped_trailing_punctuation(self):
+        content = "MEDIA:/tmp/example.mp3\\\\\""
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("/tmp/example.mp3", False)]
+        assert cleaned == ""
+
 
 # ---------------------------------------------------------------------------
 # truncate_message
