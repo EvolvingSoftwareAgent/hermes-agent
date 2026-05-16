@@ -1260,6 +1260,28 @@ class TestAuxiliaryPoolAwareness:
         assert stale_client.chat.completions.create.await_count == 1
         assert fresh_async_client.chat.completions.create.await_count == 1
 
+    def test_initial_auto_codex_client_drops_incompatible_slash_model_override(self):
+        import agent.auxiliary_client as aux
+
+        fake_client = MagicMock()
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fake_client, "gpt-5.5"),
+        ) as mock_resolve:
+            aux.shutdown_cached_clients()
+            try:
+                client, model = aux._get_cached_client(
+                    "auto",
+                    "google/gemini-3-flash-preview",
+                )
+            finally:
+                aux.shutdown_cached_clients()
+
+        assert client is fake_client
+        assert model == "gpt-5.5"
+        assert mock_resolve.call_count == 1
+
     def test_cached_gmi_client_keeps_explicit_slash_model_override(self):
         import agent.auxiliary_client as aux
 
