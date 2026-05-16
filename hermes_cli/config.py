@@ -2256,6 +2256,7 @@ DEFAULT_CONFIG = {
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        "tirith_trusted_ip_allowlist": [],  # Exact IPs whose tirith URL/IP findings are trusted (e.g. OCI metadata)
         "website_blocklist": {
             "enabled": False,
             "domains": [],

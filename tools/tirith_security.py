@@ -21,6 +21,7 @@ never blocks.
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 from hermes_constants import get_hermes_home
@@ -72,6 +74,7 @@ def _load_security_config() -> dict:
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        "tirith_trusted_ip_allowlist": [],
     }
     try:
         from hermes_cli.config import load_config
@@ -84,6 +87,10 @@ def _load_security_config() -> dict:
         "tirith_path": os.getenv("TIRITH_BIN", cfg.get("tirith_path", defaults["tirith_path"])),
         "tirith_timeout": _env_int("TIRITH_TIMEOUT", cfg.get("tirith_timeout", defaults["tirith_timeout"])),
         "tirith_fail_open": _env_bool("TIRITH_FAIL_OPEN", cfg.get("tirith_fail_open", defaults["tirith_fail_open"])),
+        "tirith_trusted_ip_allowlist": cfg.get(
+            "tirith_trusted_ip_allowlist",
+            defaults["tirith_trusted_ip_allowlist"],
+        ),
     }
 
 
@@ -692,9 +699,103 @@ def ensure_installed(*, log_failures: bool = True):
 
 _MAX_FINDINGS = 50
 _MAX_SUMMARY_LEN = 500
+_TRUSTED_IP_FINDING_RULES = {
+    "raw_ip_url",
+    "plain_http_to_sink",
+    "metadata_endpoint",
+}
+
+
+def _configured_trusted_ips(value) -> set[ipaddress._BaseAddress]:
+    """Parse security.tirith_trusted_ip_allowlist into IP address objects."""
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        raw_items = [part.strip() for part in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        return set()
+
+    trusted = set()
+    for item in raw_items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            trusted.add(ipaddress.ip_address(text))
+        except ValueError:
+            logger.warning("Ignoring invalid tirith trusted IP allowlist entry: %r", item)
+    return trusted
+
+
+def _host_from_evidence(raw: str) -> str:
+    """Extract a hostname/IP from a tirith evidence value."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    parsed = urllib.parse.urlparse(text)
+    if parsed.hostname:
+        return parsed.hostname
+    # Raw evidence can be an IP literal with no URL scheme.
+    return text.split("/", 1)[0].strip("[]")
+
+
+def _finding_hosts(finding: dict) -> list[str]:
+    hosts = []
+    for evidence in finding.get("evidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        raw = evidence.get("raw") or ""
+        host = _host_from_evidence(raw)
+        if host:
+            hosts.append(host)
+    return hosts
+
+
+def _finding_is_trusted_ip_only(finding: dict, trusted_ips: set[ipaddress._BaseAddress]) -> bool:
+    """Return True if a tirith finding only concerns allowlisted IP hosts."""
+    if not trusted_ips:
+        return False
+    if finding.get("rule_id") not in _TRUSTED_IP_FINDING_RULES:
+        return False
+    hosts = _finding_hosts(finding)
+    if not hosts:
+        return False
+    for host in hosts:
+        try:
+            if ipaddress.ip_address(host) not in trusted_ips:
+                return False
+        except ValueError:
+            return False
+    return True
+
+
+def _filter_trusted_ip_findings(findings: list[dict], cfg: dict) -> tuple[list[dict], int]:
+    """Drop tirith URL/IP findings for explicitly trusted IP endpoints.
+
+    This is intentionally narrow: it only suppresses URL/IP/metadata-endpoint
+    rules whose evidence hosts are all exact IPs listed in
+    security.tirith_trusted_ip_allowlist. Other findings still require normal
+    approval.
+    """
+    trusted_ips = _configured_trusted_ips(cfg.get("tirith_trusted_ip_allowlist"))
+    if not trusted_ips:
+        return findings, 0
+    kept = []
+    suppressed = 0
+    for finding in findings:
+        if _finding_is_trusted_ip_only(finding, trusted_ips):
+            suppressed += 1
+        else:
+            kept.append(finding)
+    return kept, suppressed
 
 
 def check_command_security(command: str) -> dict:
+
     """Run tirith security scan on a command.
 
     Exit code determines action (0=allow, 1=block, 2=warn). JSON enriches
@@ -774,14 +875,17 @@ def check_command_security(command: str) -> dict:
             return {"action": "allow", "findings": [], "summary": f"tirith exit code {exit_code} (fail-open)"}
         return {"action": "block", "findings": [], "summary": f"tirith exit code {exit_code} (fail-closed)"}
 
-    # Parse JSON for enrichment (never overrides the exit code verdict)
+    # Parse JSON for enrichment (never overrides the exit code verdict), then
+    # optionally suppress findings for explicitly trusted IP endpoints.
     findings = []
     summary = ""
+    json_parsed = False
     try:
         data = json.loads(result.stdout) if result.stdout.strip() else {}
         raw_findings = data.get("findings", [])
         findings = raw_findings[:_MAX_FINDINGS]
         summary = (data.get("summary", "") or "")[:_MAX_SUMMARY_LEN]
+        json_parsed = True
     except (json.JSONDecodeError, AttributeError):
         # JSON parse failure degrades findings/summary, not the verdict
         logger.debug("tirith JSON parse failed, using exit code only")
@@ -789,6 +893,17 @@ def check_command_security(command: str) -> dict:
             summary = "security issue detected (details unavailable)"
         elif action == "warn":
             summary = "security warning detected (details unavailable)"
+
+    if json_parsed and findings:
+        findings, suppressed = _filter_trusted_ip_findings(findings, cfg)
+        if suppressed and not findings:
+            return {
+                "action": "allow",
+                "findings": [],
+                "summary": f"suppressed {suppressed} trusted IP finding(s)",
+            }
+        if suppressed:
+            summary = f"{summary} (suppressed {suppressed} trusted IP finding(s))".strip()
 
     # Suppress warn verdicts that consist solely of a lookalike_tld finding for
     # the .app TLD.  .app is a legitimate gTLD used by many production services
