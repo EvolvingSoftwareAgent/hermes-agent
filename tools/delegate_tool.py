@@ -2772,28 +2772,33 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
 
 def _load_config() -> dict:
-    """Load delegation config from CLI_CONFIG or persistent config.
+    """Load delegation config with persistent file values overriding stale runtime defaults.
 
-    Checks the runtime config (cli.py CLI_CONFIG) first, then falls back
-    to the persistent config (hermes_cli/config.py load_config()) so that
-    ``delegation.model`` / ``delegation.provider`` are picked up regardless
-    of the entry point (CLI, gateway, cron).
+    Long-lived gateway/CLI processes may have imported ``cli.CLI_CONFIG`` before a
+    user changed ``~/.hermes/config.yaml``.  Treat that runtime dict as defaults,
+    then overlay the fresh file-backed ``delegation`` section so subagent model,
+    timeout, and concurrency changes take effect without requiring a gateway
+    restart.  If the file cannot be read, fall back to runtime config only.
     """
+    runtime_cfg = {}
     try:
         from cli import CLI_CONFIG
 
-        cfg = CLI_CONFIG.get("delegation") or {}
-        if cfg:
-            return cfg
+        runtime_cfg = dict(CLI_CONFIG.get("delegation") or {})
     except Exception:
-        pass
+        runtime_cfg = {}
+
     try:
         from hermes_cli.config import load_config
 
         full = load_config()
-        return full.get("delegation") or {}
+        file_cfg = dict((full or {}).get("delegation") or {})
     except Exception:
-        return {}
+        file_cfg = {}
+
+    merged = dict(runtime_cfg)
+    merged.update(file_cfg)
+    return merged
 
 
 # ---------------------------------------------------------------------------

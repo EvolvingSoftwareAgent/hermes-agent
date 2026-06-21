@@ -1,0 +1,7 @@
+name: accessibility_handoff
+version: 0.1.0
+description: "Accessibility-first human gate handoff tool: sends screenshot-aware A/B/C-only prompts over gateway clarify and returns the selected action. Designed for persistent headed browser sessions, not autonomous CAPTCHA solving."
+author: Hermes Agent
+kind: backend
+provides_tools:
+  - accessibility_handoff
