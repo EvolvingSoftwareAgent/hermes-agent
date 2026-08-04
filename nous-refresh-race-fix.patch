@@ -1,0 +1,125 @@
+diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
+index 82eb5ee7db..4721214937 100644
+--- a/hermes_cli/auth.py
++++ b/hermes_cli/auth.py
+@@ -6008,26 +6008,41 @@ def refresh_nous_oauth_from_state(
+     force_refresh: bool = False,
+     on_state_update: Optional[Callable[[Dict[str, Any], str], None]] = None,
+ ) -> Dict[str, Any]:
+-    """Refresh Nous OAuth from a state dict. Thin wrapper around refresh_nous_oauth_pure."""
++    """Refresh Nous OAuth from a state dict. Thin wrapper around refresh_nous_oauth_pure.
++
++    Serializes the refresh under the cross-process shared-store lock so
++    concurrent refreshers (gateway runtime path, credential-pool path,
++    web-server device-code poll, CLI) never POST the same single-use
++    refresh token. Nous rotates the refresh token on every refresh, so two
++    processes refreshing with the same token trip the portal's reuse
++    detector (``invalid_grant`` / ``refresh_token_reused``) and the whole
++    session chain is quarantined (#15099). After acquiring the lock we
++    re-merge the shared store: if a concurrent winner already rotated the
++    token, we adopt it and skip the POST entirely.
++    """
+     tls = state.get("tls") or {}
+-    return refresh_nous_oauth_pure(
+-        state.get("access_token", ""),
+-        state.get("refresh_token", ""),
+-        state.get("client_id", "hermes-cli"),
+-        state.get("portal_base_url", DEFAULT_NOUS_PORTAL_URL),
+-        state.get("inference_base_url", DEFAULT_NOUS_INFERENCE_URL),
+-        token_type=state.get("token_type", "Bearer"),
+-        scope=state.get("scope", DEFAULT_NOUS_SCOPE),
+-        obtained_at=state.get("obtained_at"),
+-        expires_at=state.get("expires_at"),
+-        agent_key=state.get("agent_key"),
+-        agent_key_expires_at=state.get("agent_key_expires_at"),
+-        timeout_seconds=timeout_seconds,
+-        insecure=tls.get("insecure"),
+-        ca_bundle=tls.get("ca_bundle"),
+-        force_refresh=force_refresh,
+-        on_state_update=on_state_update,
+-    )
++    with _nous_shared_store_lock(
++        timeout_seconds=max(timeout_seconds + 5.0, AUTH_LOCK_TIMEOUT_SECONDS)
++    ):
++        _merge_shared_nous_oauth_state(state)
++        return refresh_nous_oauth_pure(
++            state.get("access_token", ""),
++            state.get("refresh_token", ""),
++            state.get("client_id", "hermes-cli"),
++            state.get("portal_base_url", DEFAULT_NOUS_PORTAL_URL),
++            state.get("inference_base_url", DEFAULT_NOUS_INFERENCE_URL),
++            token_type=state.get("token_type", "Bearer"),
++            scope=state.get("scope", DEFAULT_NOUS_SCOPE),
++            obtained_at=state.get("obtained_at"),
++            expires_at=state.get("expires_at"),
++            agent_key=state.get("agent_key"),
++            agent_key_expires_at=state.get("agent_key_expires_at"),
++            timeout_seconds=timeout_seconds,
++            insecure=tls.get("insecure"),
++            ca_bundle=tls.get("ca_bundle"),
++            force_refresh=force_refresh,
++            on_state_update=on_state_update,
++        )
+ 
+ 
+ def persist_nous_credentials(
+diff --git a/tests/hermes_cli/test_auth_nous_provider.py b/tests/hermes_cli/test_auth_nous_provider.py
+index a3be5053d0..1e810baa73 100644
+--- a/tests/hermes_cli/test_auth_nous_provider.py
++++ b/tests/hermes_cli/test_auth_nous_provider.py
+@@ -809,6 +809,55 @@ def test_refresh_token_reuse_detection_surfaces_actionable_message():
+     assert exc_info.value.relogin_required is True
+ 
+ 
++def test_refresh_nous_oauth_from_state_serializes_under_shared_lock(tmp_path, monkeypatch):
++    """Regression for the concurrent-refresh race that quarantined Nous auth.
++
++    Nous refresh tokens are single-use and rotate on every refresh. When two
++    Hermes processes refresh concurrently (gateway runtime path, credential
++    pool, web-server device-code poll, CLI), both can POST the same refresh
++    token; the loser hits ``invalid_grant`` / ``refresh_token_reused`` and the
++    whole session chain is quarantined (#15099). ``refresh_nous_oauth_from_state``
++    must serialize the POST through the cross-process shared-store lock and,
++    after acquiring it, re-merge the shared store so a concurrent winner's
++    rotated token is adopted instead of POSTing the stale one.
++    """
++    from hermes_cli import auth as auth_mod
++
++    # Simulate a concurrent winner: before the pure refresh runs, the shared
++    # store already holds a rotated token pair.
++    rotated = {
++        "access_token": "access-rotated",
++        "refresh_token": "refresh-rotated",
++        "expires_at": _future_iso(3600),
++    }
++    monkeypatch.setattr(auth_mod, "_read_shared_nous_state", lambda: dict(rotated))
++
++    posts = []
++
++    def _fake_refresh(access_token, refresh_token, client_id, portal_base_url,
++                      inference_base_url, **kwargs):
++        posts.append(refresh_token)
++        return {
++            "access_token": "access-fresh",
++            "refresh_token": "refresh-fresh",
++            "expires_in": 3600,
++            "inference_base_url": inference_base_url,
++        }
++
++    monkeypatch.setattr(auth_mod, "refresh_nous_oauth_pure", _fake_refresh)
++
++    # Shared-state path must resolve for the lock's lock_path lookup.
++    monkeypatch.setattr(auth_mod, "_nous_shared_store_path", lambda: tmp_path / "shared.json")
++
++    state = dict(_full_state_fixture())
++    state["refresh_token"] = "refresh-stale"
++    result = auth_mod.refresh_nous_oauth_from_state(state)
++
++    # The stale token must never be POSTed: the rotated one is adopted instead.
++    assert posts == ["refresh-rotated"]
++    assert result is not None
++
++
+ def test_refresh_token_exchange_sends_refresh_token_header():
+     """Nous refresh tokens must be sent in a header so sandbox proxies can
+     substitute placeholder credentials without parsing form bodies.
